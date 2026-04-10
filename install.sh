@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remnawave 一键安装脚本
+# Remnawave 一键安装脚本 (Ultimate Edition)
 
 set -e
 
@@ -7,7 +7,7 @@ INSTALL_DIR="/opt/remnawave"
 NGINX_DIR="/opt/remnawave/nginx"
 
 echo "=========================================="
-echo " Remnawave 一键安装脚本 (Stable Release)"
+echo " Remnawave 一键安装脚本 (稳定完美版)"
 echo "=========================================="
 echo "注意事项："
 echo "1. 请确保域名已解析到本机 IP。"
@@ -18,7 +18,7 @@ echo "1. 安装 Docker（如未安装）"
 echo "2. 拉取 Remnawave 官方 docker-compose 与 .env"
 echo "3. 自动生成 JWT / Postgres 等随机密钥"
 echo "4. 设置订阅域名 SUB_PUBLIC_DOMAIN"
-echo "5. 启动 Remnawave 面板容器 (已修复 0.0.0.0 监听问题)"
+echo "5. 启动 Remnawave 面板 (已修复 0.0.0.0 监听与 iptables 冲突)"
 echo "6. 切换 CA 到 Let's Encrypt 并申请证书"
 echo "7. 生成 Nginx 配置 (已解决 HTTPS 代理拦截) 并启动"
 echo "=========================================="
@@ -67,13 +67,13 @@ apt-get install -y curl socat cron openssl iptables ufw
 
 echo ">>> [2/8] 正在执行：关闭防火墙并放行所有端口..."
 
-# 1. 关闭 UFW
+# 关闭 UFW
 if command -v ufw >/dev/null 2>&1; then
     echo "   - 正在禁用 UFW..."
     ufw disable
 fi
 
-# 2. 清空 iptables 规则并允许所有流量
+# 清空 iptables 规则并允许所有流量
 if command -v iptables >/dev/null 2>&1; then
     echo "   - 正在清空 iptables 规则并允许所有连接..."
     iptables -P INPUT ACCEPT
@@ -82,7 +82,7 @@ if command -v iptables >/dev/null 2>&1; then
     iptables -F
     iptables -X
     
-    # 尝试保存规则 (如果安装了 iptables-persistent)
+    # 尝试保存规则
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save
     fi
@@ -91,13 +91,20 @@ fi
 echo "✅ 防火墙已关闭，所有端口已放行。"
 
 #------------------------#
-# 3. 安装 Docker
+# 3. 安装 Docker (并修复 iptables 链)
 #------------------------#
 if ! command -v docker >/dev/null 2>&1; then
   echo ">>> [3/8] 未检测到 Docker，正在安装..."
   curl -fsSL https://get.docker.com | sh
 else
-  echo ">>> [3/8] Docker 已安装，跳过。"
+  echo ">>> [3/8] Docker 已安装，跳过安装环节。"
+fi
+
+# === 核心修复 3: 重启 Docker 以重建被清理的 iptables 链 ===
+echo "   - 正在重启 Docker 服务以恢复网络路由链..."
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart docker
+    sleep 3 # 等待 Docker 完全启动
 fi
 
 #------------------------#
@@ -107,33 +114,30 @@ echo ">>> [4/8] 创建目录并下载配置文件..."
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
-# 下载 docker-compose.yml
 if [ ! -f docker-compose.yml ]; then
   echo "   - 正在下载 docker-compose.yml..."
   curl -o docker-compose.yml https://raw.githubusercontent.com/vlongx/remnawave-installer/refs/heads/main/docker-compose.yml
   
-  # === 修复官方文件的格式错误 ===
   echo "   - 正在自动修复 docker-compose.yml 中的格式错误..."
   sed -i '/\/opt\/remnawave\/nginx/d' docker-compose.yml
 fi
 
-# 下载 .env.sample
 if [ ! -f .env ]; then
   curl -o .env https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/.env.sample
 fi
 
 #------------------------#
-# 5. 配置 .env 并启动后端 (强制生成新密钥)
+# 5. 配置 .env 并启动后端 
 #------------------------#
 echo ">>> [5/8] 正在强制生成新密钥并配置后端..."
 
-# === 强制替换逻辑 ===
+# 强制替换安全密钥
 sed -i "s/^JWT_AUTH_SECRET=.*/JWT_AUTH_SECRET=$(openssl rand -hex 64)/" .env
 sed -i "s/^JWT_API_TOKENS_SECRET=.*/JWT_API_TOKENS_SECRET=$(openssl rand -hex 64)/" .env
 sed -i "s/^METRICS_PASS=.*/METRICS_PASS=$(openssl rand -hex 64)/" .env
 sed -i "s/^WEBHOOK_SECRET_HEADER=.*/WEBHOOK_SECRET_HEADER=$(openssl rand -hex 64)/" .env
 
-# === 强制重置数据库密码 ===
+# 强制重置数据库密码
 pw=$(openssl rand -hex 24)
 sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$pw/" .env
 sed -i "s|^\(DATABASE_URL=\"postgresql://postgres:\)[^@]*\(@.*\)|\1$pw\2|" .env
@@ -158,33 +162,28 @@ else
   sed -i "s/^APP_HOST=.*/APP_HOST=0.0.0.0/" .env
 fi
 
-# 停止旧容器并启动新容器
-echo "   - 正在重启后端容器以应用新密钥..."
+echo "   - 正在启动后端容器以应用新配置..."
 docker compose down >/dev/null 2>&1 || true
 docker compose up -d
-echo ">>> Remnawave 后端容器已重新启动。"
+echo ">>> Remnawave 后端容器已成功启动。"
 
 #------------------------#
 # 6. 申请 SSL 证书
 #------------------------#
 echo ">>> [6/8] 配置 acme.sh 并申请证书..."
 
-# 确保网络存在
 docker network create remnawave-network >/dev/null 2>&1 || true
 
-# 安装 acme.sh
 if [ ! -d "$HOME/.acme.sh" ]; then
   curl https://get.acme.sh | sh -s email="$EMAIL"
 fi
 ACME_SH="$HOME/.acme.sh/acme.sh"
 mkdir -p "$NGINX_DIR"
 
-# 切换 CA 为 Let's Encrypt
 echo "   - 切换 CA 为 Let's Encrypt..."
 $ACME_SH --set-default-ca --server letsencrypt
 $ACME_SH --register-account -m "$EMAIL" || true
 
-# 停止可能占用 80 端口的容器
 docker stop remnawave-nginx >/dev/null 2>&1 || true
 
 echo "   - 开始申请证书 (Standalone 模式)..."
@@ -194,7 +193,7 @@ $ACME_SH --issue --standalone -d "$MAIN_DOMAIN" \
   --force
 
 if [ ! -f "$NGINX_DIR/fullchain.pem" ]; then
-    echo "❌ 证书申请失败！请确认域名解析正确。"
+    echo "❌ 证书申请失败！请确认域名解析正确并在云服务商后台开放了 80 端口。"
     exit 1
 fi
 echo "✅ 证书申请成功。"
@@ -281,7 +280,7 @@ docker compose up -d
 
 echo
 echo "=========================================="
-echo " ✅ 修复与安装完成！"
+echo " ✅ 修复与安装全部完成！"
 echo " 面板地址：https://$MAIN_DOMAIN"
 echo " 订阅域名：$SUB_DOMAIN"
 echo "=========================================="
