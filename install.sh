@@ -7,7 +7,7 @@ INSTALL_DIR="/opt/remnawave"
 NGINX_DIR="/opt/remnawave/nginx"
 
 echo "=========================================="
-echo " Remnawave 一键安装脚本"
+echo " Remnawave 一键安装脚本 (Stable Release)"
 echo "=========================================="
 echo "注意事项："
 echo "1. 请确保域名已解析到本机 IP。"
@@ -18,9 +18,9 @@ echo "1. 安装 Docker（如未安装）"
 echo "2. 拉取 Remnawave 官方 docker-compose 与 .env"
 echo "3. 自动生成 JWT / Postgres 等随机密钥"
 echo "4. 设置订阅域名 SUB_PUBLIC_DOMAIN"
-echo "5. 启动 Remnawave 面板容器"
+echo "5. 启动 Remnawave 面板容器 (已修复 0.0.0.0 监听问题)"
 echo "6. 切换 CA 到 Let's Encrypt 并申请证书"
-echo "7. 生成 Nginx 配置（包含 HTTP 跳转）并启动"
+echo "7. 生成 Nginx 配置 (已解决 HTTPS 代理拦截) 并启动"
 echo "=========================================="
 echo
 
@@ -28,7 +28,7 @@ echo
 # 0. 检查 root 权限
 #------------------------#
 if [ "$EUID" -ne 0 ]; then
-  echo "请使用 root 运行本脚本（例如：sudo bash remnawave-onekey.sh）"
+  echo "请使用 root 运行本脚本（例如：sudo bash install.sh）"
   exit 1
 fi
 
@@ -145,6 +145,19 @@ else
   echo "SUB_PUBLIC_DOMAIN=${SUB_DOMAIN}/api/sub" >> .env
 fi
 
+# === 核心修复 1: 强制后端监听 0.0.0.0 防止 Nginx 连不上 (Connection refused) ===
+if ! grep -q "^HOST=" .env; then
+  echo "HOST=0.0.0.0" >> .env
+else
+  sed -i "s/^HOST=.*/HOST=0.0.0.0/" .env
+fi
+
+if ! grep -q "^APP_HOST=" .env; then
+  echo "APP_HOST=0.0.0.0" >> .env
+else
+  sed -i "s/^APP_HOST=.*/APP_HOST=0.0.0.0/" .env
+fi
+
 # 停止旧容器并启动新容器
 echo "   - 正在重启后端容器以应用新密钥..."
 docker compose down >/dev/null 2>&1 || true
@@ -216,7 +229,10 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # === 核心修复 2: 强制声明 https，防止后端安全拦截 (Empty reply / 502) ===
+        proxy_set_header X-Forwarded-Proto https; 
+        
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
     }
@@ -265,7 +281,7 @@ docker compose up -d
 
 echo
 echo "=========================================="
-echo " ✅ 修复完成！(防火墙已全部关闭)"
+echo " ✅ 修复与安装完成！"
 echo " 面板地址：https://$MAIN_DOMAIN"
 echo " 订阅域名：$SUB_DOMAIN"
 echo "=========================================="
