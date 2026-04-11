@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Remnawave 一键安装脚本（最终极简稳定版）
+# Remnawave 一键安装脚本（最终防退出版）
 # Debian / Ubuntu
-# 思路：不做复杂探测，不在安装阶段死等；只负责安装、启动、签证书、配置 Nginx。
 
-set -Eeuo pipefail
+set -u
 
 INSTALL_DIR="/opt/remnawave"
 NGINX_SITE="/etc/nginx/sites-available/remnawave.conf"
@@ -27,6 +26,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+ok_or_die() {
+  local code="$1"
+  local msg="$2"
+  [[ "$code" -eq 0 ]] || die "$msg"
+}
+
 require_root() {
   [[ "${EUID}" -eq 0 ]] || die "请使用 root 运行本脚本"
 }
@@ -37,15 +42,20 @@ require_apt() {
 
 backup_if_exists() {
   local f="$1"
-  [[ -e "$f" ]] && cp -a "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
+  if [[ -e "$f" ]]; then
+    cp -a "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)" || die "备份失败: $f"
+  fi
 }
 
 set_env_kv() {
   local file="$1" key="$2" value="$3"
-  if grep -qE "^${key}=" "$file" 2>/dev/null; then
+  grep -qE "^${key}=" "$file" 2>/dev/null
+  if [[ $? -eq 0 ]]; then
     sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+    ok_or_die $? "写入 ${key} 失败"
   else
     echo "${key}=${value}" >> "$file"
+    ok_or_die $? "追加 ${key} 失败"
   fi
 }
 
@@ -66,9 +76,11 @@ retry_curl() {
   local url="$1"
   local dest="$2"
   local i
+
   for i in 1 2 3 4 5; do
-    if curl -fL --connect-timeout 15 --max-time 120 --retry 3 --retry-all-errors -o "$dest" "$url"; then
-      [[ -s "$dest" ]] && return 0
+    curl -fL --connect-timeout 15 --max-time 120 --retry 3 --retry-all-errors -o "$dest" "$url"
+    if [[ $? -eq 0 && -s "$dest" ]]; then
+      return 0
     fi
     warn "下载失败，第 ${i}/5 次重试: $url"
     sleep 2
@@ -81,37 +93,45 @@ download_backend_file() {
   local dest="$2"
   local raw_url="https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/${remote_file}"
 
-  mkdir -p "$TMP_DIR"
+  mkdir -p "$TMP_DIR" || die "无法创建临时目录"
 
-  if retry_curl "$raw_url" "$dest"; then
+  retry_curl "$raw_url" "$dest"
+  if [[ $? -eq 0 && -s "$dest" ]]; then
     return 0
   fi
 
   warn "直接下载失败，切换 git clone 兜底..."
   rm -rf "$TMP_DIR/backend" >/dev/null 2>&1 || true
 
-  if git clone --depth 1 https://github.com/remnawave/backend.git "$TMP_DIR/backend" >/dev/null 2>&1; then
-    [[ -f "$TMP_DIR/backend/${remote_file}" ]] || die "官方仓库缺少文件: ${remote_file}"
-    cp "$TMP_DIR/backend/${remote_file}" "$dest" || die "复制文件失败: ${remote_file}"
-    [[ -s "$dest" ]] || die "文件为空: $dest"
-    return 0
+  git clone --depth 1 https://github.com/remnawave/backend.git "$TMP_DIR/backend" >/dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
+    die "git clone 官方仓库失败"
   fi
 
-  die "下载官方文件失败: ${remote_file}"
+  [[ -f "$TMP_DIR/backend/${remote_file}" ]] || die "官方仓库缺少文件: ${remote_file}"
+
+  cp "$TMP_DIR/backend/${remote_file}" "$dest"
+  ok_or_die $? "复制文件失败: ${remote_file}"
+
+  [[ -s "$dest" ]] || die "文件为空: $dest"
 }
 
 install_base() {
   info "安装基础依赖..."
   apt-get update -y
+  ok_or_die $? "apt-get update 失败"
+
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl socat cron openssl ca-certificates gnupg lsb-release \
     nginx ufw iptables iproute2 git
+  ok_or_die $? "基础依赖安装失败"
 }
 
 install_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     info "未检测到 Docker，开始安装..."
     curl -fsSL https://get.docker.com | sh
+    ok_or_die $? "Docker 安装失败"
   else
     info "Docker 已安装，跳过安装。"
   fi
@@ -119,10 +139,14 @@ install_docker() {
   systemctl enable docker >/dev/null 2>&1 || true
   systemctl restart docker >/dev/null 2>&1 || true
 
-  if ! docker compose version >/dev/null 2>&1; then
+  docker compose version >/dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
     info "安装 Docker Compose 插件..."
     apt-get update -y
+    ok_or_die $? "apt-get update 失败"
+
     DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin
+    ok_or_die $? "Docker Compose 插件安装失败"
   fi
 }
 
@@ -137,6 +161,7 @@ net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 vm.overcommit_memory=1
 EOF
+  ok_or_die $? "写入 sysctl 配置失败"
 
   sysctl --system >/dev/null 2>&1 || true
   sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
@@ -151,6 +176,7 @@ EOF
 
 repair_docker_network() {
   info "修复 Docker 网络链..."
+
   systemctl stop docker.socket >/dev/null 2>&1 || true
   systemctl stop docker.service >/dev/null 2>&1 || true
 
@@ -169,26 +195,38 @@ repair_docker_network() {
 
   systemctl start docker.socket >/dev/null 2>&1 || true
   systemctl start docker.service
+  ok_or_die $? "Docker 服务启动失败"
+
   sleep 3
 }
 
 prepare_project() {
   info "准备 Remnawave 目录与配置..."
+
   mkdir -p "$INSTALL_DIR"
-  cd "$INSTALL_DIR"
+  ok_or_die $? "无法创建目录: $INSTALL_DIR"
+
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
   backup_if_exists "$INSTALL_DIR/docker-compose.yml"
   backup_if_exists "$INSTALL_DIR/.env"
 
-  info "下载官方 docker-compose 与 .env.sample..."
+  info "下载官方 docker-compose.yml..."
   download_backend_file "docker-compose-prod.yml" "$INSTALL_DIR/docker-compose.yml"
 
+  info "下载官方 .env.sample..."
   if [[ ! -f "$INSTALL_DIR/.env" ]]; then
     download_backend_file ".env.sample" "$INSTALL_DIR/.env"
+  else
+    info "检测到现有 .env，跳过重新下载。"
   fi
+
+  [[ -s "$INSTALL_DIR/docker-compose.yml" ]] || die "docker-compose.yml 下载为空"
+  [[ -s "$INSTALL_DIR/.env" ]] || die ".env 下载为空"
 }
 
 select_ports() {
+  info "选择本地端口..."
   APP_PORT="$(find_free_port 3000)"
   DB_PORT="$(find_free_port 6767)"
 
@@ -198,16 +236,20 @@ select_ports() {
 
 patch_compose_ports() {
   info "调整 docker-compose 端口绑定..."
-  cd "$INSTALL_DIR"
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
   sed -i -E "s|127\.0\.0\.1:3000-3001:3000-3001|127.0.0.1:${APP_PORT}-3001:3000-3001|g" docker-compose.yml
   sed -i -E "s|127\.0\.0\.1:3000:3000|127.0.0.1:${APP_PORT}:3000|g" docker-compose.yml
   sed -i -E "s|127\.0\.0\.1:6767:5432|127.0.0.1:${DB_PORT}:5432|g" docker-compose.yml
+
+  if [[ $? -ne 0 ]]; then
+    die "docker-compose 端口修改失败"
+  fi
 }
 
 configure_env() {
   info "写入 Remnawave 环境变量..."
-  cd "$INSTALL_DIR"
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
   set_env_kv .env FRONT_END_DOMAIN "$MAIN_DOMAIN"
   set_env_kv .env PANEL_DOMAIN "$MAIN_DOMAIN"
@@ -220,45 +262,53 @@ configure_env() {
   DB_PASS="$(openssl rand -hex 24)"
   set_env_kv .env POSTGRES_PASSWORD "$DB_PASS"
 
-  if grep -q '^DATABASE_URL=' .env; then
+  grep -q '^DATABASE_URL=' .env
+  if [[ $? -eq 0 ]]; then
     sed -i "s|^\(DATABASE_URL=\"postgresql://postgres:\)[^@]*\(@.*\)|\1${DB_PASS}\2|" .env
+    ok_or_die $? "修改 DATABASE_URL 失败"
   else
     echo "DATABASE_URL=\"postgresql://postgres:${DB_PASS}@remnawave-db:5432/postgres\"" >> .env
+    ok_or_die $? "追加 DATABASE_URL 失败"
   fi
 }
 
 start_stack() {
   info "启动 Remnawave 容器..."
-  cd "$INSTALL_DIR"
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
   docker compose down --remove-orphans >/dev/null 2>&1 || true
   docker rm -f remnawave remnawave-db remnawave-redis >/dev/null 2>&1 || true
 
-  if ! docker compose up -d; then
+  docker compose up -d
+  if [[ $? -ne 0 ]]; then
     warn "首次启动失败，尝试修复 Docker 网络后重试..."
     repair_docker_network
-    docker compose up -d || die "Remnawave 启动失败"
+    docker compose up -d
+    ok_or_die $? "Remnawave 启动失败"
   fi
 
   sleep 8
 
-  docker ps --format '{{.Names}}' | grep -qx 'remnawave' || die "remnawave 容器未运行"
-  docker ps --format '{{.Names}}' | grep -qx 'remnawave-db' || die "remnawave-db 容器未运行"
-  docker ps --format '{{.Names}}' | grep -qx 'remnawave-redis' || die "remnawave-redis 容器未运行"
+  docker ps --format '{{.Names}}' | grep -qx 'remnawave' >/dev/null 2>&1 || die "remnawave 容器未运行"
+  docker ps --format '{{.Names}}' | grep -qx 'remnawave-db' >/dev/null 2>&1 || die "remnawave-db 容器未运行"
+  docker ps --format '{{.Names}}' | grep -qx 'remnawave-redis' >/dev/null 2>&1 || die "remnawave-redis 容器未运行"
 }
 
 install_acme() {
   info "安装 acme.sh..."
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
     curl https://get.acme.sh | sh -s email="$EMAIL"
+    ok_or_die $? "acme.sh 安装失败"
   fi
+
   ACME_SH="/root/.acme.sh/acme.sh"
-  [[ -x "$ACME_SH" ]] || die "acme.sh 安装失败"
+  [[ -x "$ACME_SH" ]] || die "acme.sh 不存在"
 }
 
 issue_cert() {
   info "申请 SSL 证书..."
   mkdir -p "$CERT_DIR"
+  ok_or_die $? "无法创建证书目录"
 
   systemctl stop nginx >/dev/null 2>&1 || true
 
@@ -272,12 +322,15 @@ issue_cert() {
   fi
 
   "$ACME_SH" --issue --standalone "${args[@]}" --keylength ec-256 --force
+  ok_or_die $? "证书申请失败"
+
   "$ACME_SH" --install-cert -d "$MAIN_DOMAIN" --ecc \
     --fullchain-file "$CERT_DIR/fullchain.cer" \
     --key-file "$CERT_DIR/privkey.key"
+  ok_or_die $? "证书安装失败"
 
-  [[ -f "$CERT_DIR/fullchain.cer" ]] || die "证书安装失败"
-  [[ -f "$CERT_DIR/privkey.key" ]] || die "证书安装失败"
+  [[ -f "$CERT_DIR/fullchain.cer" ]] || die "缺少 fullchain.cer"
+  [[ -f "$CERT_DIR/privkey.key" ]] || die "缺少 privkey.key"
 }
 
 write_nginx() {
@@ -323,13 +376,18 @@ server {
     }
 }
 EOF
+  ok_or_die $? "写入 Nginx 配置失败"
 
   rm -f /etc/nginx/sites-enabled/default
   ln -sf "$NGINX_SITE" "$NGINX_ENABLED"
+  ok_or_die $? "启用 Nginx 站点失败"
 
-  nginx -t || die "Nginx 配置测试失败"
+  nginx -t >/dev/null 2>&1
+  ok_or_die $? "Nginx 配置测试失败"
+
   systemctl enable nginx >/dev/null 2>&1 || true
-  systemctl restart nginx || die "Nginx 启动失败"
+  systemctl restart nginx
+  ok_or_die $? "Nginx 启动失败"
 }
 
 open_firewall() {
@@ -354,21 +412,11 @@ show_result() {
   echo " 本地数据库端口: 127.0.0.1:${DB_PORT}"
   echo " 安装目录: $INSTALL_DIR"
   echo "=========================================="
-  echo
-  echo "可自行检查："
-  echo "docker ps"
-  echo "docker compose -f $INSTALL_DIR/docker-compose.yml logs --tail=100 remnawave"
-  echo "nginx -t"
-  echo "systemctl status nginx"
 }
 
 main() {
   require_root
   require_apt
-
-  echo "=========================================="
-  echo " Remnawave 一键安装脚本（最终极简稳定版）"
-  echo "=========================================="
 
   read -rp "请输入【面板访问域名】（例如 panel.example.com）: " MAIN_DOMAIN
   [[ -n "${MAIN_DOMAIN}" ]] || die "面板域名不能为空"
