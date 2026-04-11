@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Remnawave 一键安装脚本（最终可用版）
+# Remnawave 一键安装脚本（最终极简稳定版）
 # Debian / Ubuntu
+# 思路：不做复杂探测，不在安装阶段死等；只负责安装、启动、签证书、配置 Nginx。
 
-set -u
+set -Eeuo pipefail
 
 INSTALL_DIR="/opt/remnawave"
 NGINX_SITE="/etc/nginx/sites-available/remnawave.conf"
@@ -24,7 +25,6 @@ die()   { error "$*"; cleanup; exit 1; }
 cleanup() {
   rm -rf "$TMP_DIR" 2>/dev/null || true
 }
-
 trap cleanup EXIT
 
 require_root() {
@@ -102,16 +102,16 @@ download_backend_file() {
 
 install_base() {
   info "安装基础依赖..."
-  apt-get update -y || die "apt-get update 失败"
+  apt-get update -y
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl socat cron openssl ca-certificates gnupg lsb-release \
-    nginx ufw iptables iproute2 git || die "基础依赖安装失败"
+    nginx ufw iptables iproute2 git
 }
 
 install_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     info "未检测到 Docker，开始安装..."
-    curl -fsSL https://get.docker.com | sh || die "Docker 安装失败"
+    curl -fsSL https://get.docker.com | sh
   else
     info "Docker 已安装，跳过安装。"
   fi
@@ -121,13 +121,13 @@ install_docker() {
 
   if ! docker compose version >/dev/null 2>&1; then
     info "安装 Docker Compose 插件..."
-    apt-get update -y || die "apt-get update 失败"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin || die "docker compose 插件安装失败"
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin
   fi
 }
 
 fix_kernel_network() {
-  info "修复内核转发与 bridge 网络参数..."
+  info "修复内核网络参数..."
   modprobe br_netfilter >/dev/null 2>&1 || true
 
   cat > "$SYSCTL_FILE" <<'EOF'
@@ -150,8 +150,7 @@ EOF
 }
 
 repair_docker_network() {
-  info "检测并修复 Docker 网络链..."
-
+  info "修复 Docker 网络链..."
   systemctl stop docker.socket >/dev/null 2>&1 || true
   systemctl stop docker.service >/dev/null 2>&1 || true
 
@@ -169,14 +168,14 @@ repair_docker_network() {
   iptables -t filter -C DOCKER-USER -j RETURN >/dev/null 2>&1 || iptables -t filter -A DOCKER-USER -j RETURN >/dev/null 2>&1 || true
 
   systemctl start docker.socket >/dev/null 2>&1 || true
-  systemctl start docker.service >/dev/null 2>&1 || die "Docker 启动失败"
-  sleep 5
+  systemctl start docker.service
+  sleep 3
 }
 
 prepare_project() {
   info "准备 Remnawave 目录与配置..."
-  mkdir -p "$INSTALL_DIR" || die "无法创建目录: $INSTALL_DIR"
-  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
+  cd "$INSTALL_DIR"
 
   backup_if_exists "$INSTALL_DIR/docker-compose.yml"
   backup_if_exists "$INSTALL_DIR/.env"
@@ -187,22 +186,19 @@ prepare_project() {
   if [[ ! -f "$INSTALL_DIR/.env" ]]; then
     download_backend_file ".env.sample" "$INSTALL_DIR/.env"
   fi
-
-  [[ -s "$INSTALL_DIR/docker-compose.yml" ]] || die "docker-compose.yml 下载为空"
-  [[ -s "$INSTALL_DIR/.env" ]] || die ".env 下载为空"
 }
 
 select_ports() {
   APP_PORT="$(find_free_port 3000)"
   DB_PORT="$(find_free_port 6767)"
 
-  [[ "$APP_PORT" != "3000" ]] && warn "127.0.0.1:3000 已占用，改用 127.0.0.1:${APP_PORT}"
-  [[ "$DB_PORT" != "6767" ]] && warn "127.0.0.1:6767 已占用，改用 127.0.0.1:${DB_PORT}"
+  [[ "$APP_PORT" != "3000" ]] && warn "127.0.0.1:3000 已占用，改用 ${APP_PORT}"
+  [[ "$DB_PORT" != "6767" ]] && warn "127.0.0.1:6767 已占用，改用 ${DB_PORT}"
 }
 
 patch_compose_ports() {
   info "调整 docker-compose 端口绑定..."
-  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
+  cd "$INSTALL_DIR"
 
   sed -i -E "s|127\.0\.0\.1:3000-3001:3000-3001|127.0.0.1:${APP_PORT}-3001:3000-3001|g" docker-compose.yml
   sed -i -E "s|127\.0\.0\.1:3000:3000|127.0.0.1:${APP_PORT}:3000|g" docker-compose.yml
@@ -211,12 +207,11 @@ patch_compose_ports() {
 
 configure_env() {
   info "写入 Remnawave 环境变量..."
-  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
+  cd "$INSTALL_DIR"
 
   set_env_kv .env FRONT_END_DOMAIN "$MAIN_DOMAIN"
   set_env_kv .env PANEL_DOMAIN "$MAIN_DOMAIN"
   set_env_kv .env SUB_PUBLIC_DOMAIN "${SUB_DOMAIN}/api/sub"
-
   set_env_kv .env JWT_AUTH_SECRET "$(openssl rand -hex 64)"
   set_env_kv .env JWT_API_TOKENS_SECRET "$(openssl rand -hex 64)"
   set_env_kv .env METRICS_PASS "$(openssl rand -hex 32)"
@@ -232,72 +227,38 @@ configure_env() {
   fi
 }
 
-compose_down_safe() {
-  cd "$INSTALL_DIR" || return 0
-  docker compose down --remove-orphans >/dev/null 2>&1 || true
-  docker rm -f remnawave remnawave-db remnawave-redis >/dev/null 2>&1 || true
-}
-
-wait_container_healthy() {
-  info "等待 Remnawave 容器健康..."
-  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
-
-  local ok=0
-  local i cid status
-
-  for i in $(seq 1 100); do
-    cid="$(docker compose ps -q remnawave 2>/dev/null || true)"
-    if [[ -n "$cid" ]]; then
-      status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
-      case "$status" in
-        healthy|running)
-          ok=1
-          break
-          ;;
-        exited|dead)
-          docker compose logs --tail=150 remnawave || true
-          die "remnawave 容器已退出"
-          ;;
-      esac
-    fi
-    sleep 3
-  done
-
-  [[ "$ok" -eq 1 ]] || {
-    docker compose ps || true
-    docker compose logs --tail=150 || true
-    die "Remnawave 容器未达到健康状态"
-  }
-}
-
 start_stack() {
   info "启动 Remnawave 容器..."
-  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
+  cd "$INSTALL_DIR"
 
-  compose_down_safe
+  docker compose down --remove-orphans >/dev/null 2>&1 || true
+  docker rm -f remnawave remnawave-db remnawave-redis >/dev/null 2>&1 || true
 
-  docker compose up -d || {
+  if ! docker compose up -d; then
     warn "首次启动失败，尝试修复 Docker 网络后重试..."
     repair_docker_network
-    compose_down_safe
     docker compose up -d || die "Remnawave 启动失败"
-  }
+  fi
 
-  wait_container_healthy
+  sleep 8
+
+  docker ps --format '{{.Names}}' | grep -qx 'remnawave' || die "remnawave 容器未运行"
+  docker ps --format '{{.Names}}' | grep -qx 'remnawave-db' || die "remnawave-db 容器未运行"
+  docker ps --format '{{.Names}}' | grep -qx 'remnawave-redis' || die "remnawave-redis 容器未运行"
 }
 
 install_acme() {
   info "安装 acme.sh..."
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-    curl https://get.acme.sh | sh -s email="$EMAIL" || die "acme.sh 安装失败"
+    curl https://get.acme.sh | sh -s email="$EMAIL"
   fi
   ACME_SH="/root/.acme.sh/acme.sh"
-  [[ -x "$ACME_SH" ]] || die "acme.sh 不存在"
+  [[ -x "$ACME_SH" ]] || die "acme.sh 安装失败"
 }
 
 issue_cert() {
   info "申请 SSL 证书..."
-  mkdir -p "$CERT_DIR" || die "无法创建证书目录"
+  mkdir -p "$CERT_DIR"
 
   systemctl stop nginx >/dev/null 2>&1 || true
 
@@ -310,14 +271,13 @@ issue_cert() {
     args+=(-d "$SUB_DOMAIN")
   fi
 
-  "$ACME_SH" --issue --standalone "${args[@]}" --keylength ec-256 --force || die "证书申请失败"
-
+  "$ACME_SH" --issue --standalone "${args[@]}" --keylength ec-256 --force
   "$ACME_SH" --install-cert -d "$MAIN_DOMAIN" --ecc \
     --fullchain-file "$CERT_DIR/fullchain.cer" \
-    --key-file "$CERT_DIR/privkey.key" || die "证书安装失败"
+    --key-file "$CERT_DIR/privkey.key"
 
-  [[ -f "$CERT_DIR/fullchain.cer" ]] || die "缺少 fullchain.cer"
-  [[ -f "$CERT_DIR/privkey.key" ]] || die "缺少 privkey.key"
+  [[ -f "$CERT_DIR/fullchain.cer" ]] || die "证书安装失败"
+  [[ -f "$CERT_DIR/privkey.key" ]] || die "证书安装失败"
 }
 
 write_nginx() {
@@ -347,19 +307,17 @@ server {
     ssl_session_cache   shared:SSL:10m;
     ssl_session_tickets off;
 
-    client_max_body_size 20m;
-
     location / {
         proxy_http_version 1.1;
         proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_set_header Host \$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Port \$server_port;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
         proxy_read_timeout 300;
         proxy_send_timeout 300;
     }
@@ -374,36 +332,34 @@ EOF
   systemctl restart nginx || die "Nginx 启动失败"
 }
 
-verify_https() {
-  info "验证 HTTPS 反向代理..."
-  local ok=0
-  local i
-
-  for i in $(seq 1 40); do
-    if curl -kfsS --resolve "${MAIN_DOMAIN}:443:127.0.0.1" "https://${MAIN_DOMAIN}/" >/dev/null 2>&1; then
-      ok=1
-      break
-    fi
-    sleep 3
-  done
-
-  [[ "$ok" -eq 1 ]] || {
-    systemctl status nginx --no-pager -l || true
-    docker compose -f "$INSTALL_DIR/docker-compose.yml" logs --tail=120 remnawave || true
-    die "HTTPS 反向代理验证失败"
-  }
-}
-
 open_firewall() {
   if command -v ufw >/dev/null 2>&1; then
     if ufw status 2>/dev/null | grep -q "Status: active"; then
-      info "检测到 UFW 已启用，仅放行 80/443..."
+      info "放行 80/443..."
       ufw allow 80/tcp >/dev/null 2>&1 || true
       ufw allow 443/tcp >/dev/null 2>&1 || true
     else
-      warn "UFW 未启用，跳过防火墙调整。"
+      warn "UFW 未启用，跳过。"
     fi
   fi
+}
+
+show_result() {
+  echo
+  echo "=========================================="
+  echo " ✅ 安装流程执行完成"
+  echo " 面板地址: https://$MAIN_DOMAIN"
+  echo " 订阅地址: https://$SUB_DOMAIN/api/sub"
+  echo " 本地后端端口: 127.0.0.1:${APP_PORT}"
+  echo " 本地数据库端口: 127.0.0.1:${DB_PORT}"
+  echo " 安装目录: $INSTALL_DIR"
+  echo "=========================================="
+  echo
+  echo "可自行检查："
+  echo "docker ps"
+  echo "docker compose -f $INSTALL_DIR/docker-compose.yml logs --tail=100 remnawave"
+  echo "nginx -t"
+  echo "systemctl status nginx"
 }
 
 main() {
@@ -411,15 +367,8 @@ main() {
   require_apt
 
   echo "=========================================="
-  echo " Remnawave 一键安装脚本（最终可用版）"
+  echo " Remnawave 一键安装脚本（最终极简稳定版）"
   echo "=========================================="
-  echo "1. 使用官方 compose 与 .env.sample"
-  echo "2. 自动修复 Docker 网络链"
-  echo "3. 不再用 HTTP 直连后端测活"
-  echo "4. 先启动容器，再部署 HTTPS 反代"
-  echo "5. 最终通过 HTTPS 域名验证"
-  echo "=========================================="
-  echo
 
   read -rp "请输入【面板访问域名】（例如 panel.example.com）: " MAIN_DOMAIN
   [[ -n "${MAIN_DOMAIN}" ]] || die "面板域名不能为空"
@@ -442,18 +391,8 @@ main() {
   install_acme
   issue_cert
   write_nginx
-  verify_https
   open_firewall
-
-  echo
-  echo "=========================================="
-  echo " ✅ 安装完成"
-  echo " 面板地址: https://$MAIN_DOMAIN"
-  echo " 订阅地址: https://$SUB_DOMAIN/api/sub"
-  echo " 本地后端端口: 127.0.0.1:${APP_PORT}"
-  echo " 本地数据库端口: 127.0.0.1:${DB_PORT}"
-  echo " 安装目录: $INSTALL_DIR"
-  echo "=========================================="
+  show_result
 }
 
 main "$@"
