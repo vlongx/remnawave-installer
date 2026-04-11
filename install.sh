@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remnawave 一键安装脚本（最终抗报错版）
+# Remnawave 一键安装脚本（最终可用版）
 # Debian / Ubuntu
 
 set -u
@@ -14,6 +14,7 @@ TMP_DIR="/tmp/remnawave-installer.$$"
 APP_PORT=""
 DB_PORT=""
 ACME_SH=""
+DB_PASS=""
 
 info()  { echo -e "\033[1;32m[INFO]\033[0m $*"; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -25,10 +26,6 @@ cleanup() {
 }
 
 trap cleanup EXIT
-
-run() {
-  "$@" || die "命令执行失败: $*"
-}
 
 require_root() {
   [[ "${EUID}" -eq 0 ]] || die "请使用 root 运行本脚本"
@@ -90,11 +87,11 @@ download_backend_file() {
     return 0
   fi
 
-  warn "直接下载失败，切换到 git clone 兜底..."
+  warn "直接下载失败，切换 git clone 兜底..."
   rm -rf "$TMP_DIR/backend" >/dev/null 2>&1 || true
 
   if git clone --depth 1 https://github.com/remnawave/backend.git "$TMP_DIR/backend" >/dev/null 2>&1; then
-    [[ -f "$TMP_DIR/backend/${remote_file}" ]] || die "官方仓库中未找到文件: ${remote_file}"
+    [[ -f "$TMP_DIR/backend/${remote_file}" ]] || die "官方仓库缺少文件: ${remote_file}"
     cp "$TMP_DIR/backend/${remote_file}" "$dest" || die "复制文件失败: ${remote_file}"
     [[ -s "$dest" ]] || die "文件为空: $dest"
     return 0
@@ -105,10 +102,10 @@ download_backend_file() {
 
 install_base() {
   info "安装基础依赖..."
-  run apt-get update -y
-  DEBIAN_FRONTEND=noninteractive run apt-get install -y \
+  apt-get update -y || die "apt-get update 失败"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl socat cron openssl ca-certificates gnupg lsb-release \
-    nginx ufw iptables iproute2 git
+    nginx ufw iptables iproute2 git || die "基础依赖安装失败"
 }
 
 install_docker() {
@@ -124,8 +121,8 @@ install_docker() {
 
   if ! docker compose version >/dev/null 2>&1; then
     info "安装 Docker Compose 插件..."
-    run apt-get update -y
-    DEBIAN_FRONTEND=noninteractive run apt-get install -y docker-compose-plugin
+    apt-get update -y || die "apt-get update 失败"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin || die "docker compose 插件安装失败"
   fi
 }
 
@@ -138,6 +135,7 @@ net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
+vm.overcommit_memory=1
 EOF
 
   sysctl --system >/dev/null 2>&1 || true
@@ -145,6 +143,7 @@ EOF
   sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
   sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1 || true
   sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null 2>&1 || true
+  sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
 
   iptables -P FORWARD ACCEPT >/dev/null 2>&1 || true
   ip6tables -P FORWARD ACCEPT >/dev/null 2>&1 || true
@@ -172,8 +171,6 @@ repair_docker_network() {
   systemctl start docker.socket >/dev/null 2>&1 || true
   systemctl start docker.service >/dev/null 2>&1 || die "Docker 启动失败"
   sleep 5
-
-  docker network inspect bridge >/dev/null 2>&1 || true
 }
 
 prepare_project() {
@@ -191,8 +188,8 @@ prepare_project() {
     download_backend_file ".env.sample" "$INSTALL_DIR/.env"
   fi
 
-  [[ -s "$INSTALL_DIR/docker-compose.yml" ]] || die "docker-compose.yml 下载后为空"
-  [[ -s "$INSTALL_DIR/.env" ]] || die ".env 下载后为空"
+  [[ -s "$INSTALL_DIR/docker-compose.yml" ]] || die "docker-compose.yml 下载为空"
+  [[ -s "$INSTALL_DIR/.env" ]] || die ".env 下载为空"
 }
 
 select_ports() {
@@ -207,10 +204,9 @@ patch_compose_ports() {
   info "调整 docker-compose 端口绑定..."
   cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
+  sed -i -E "s|127\.0\.0\.1:3000-3001:3000-3001|127.0.0.1:${APP_PORT}-3001:3000-3001|g" docker-compose.yml
   sed -i -E "s|127\.0\.0\.1:3000:3000|127.0.0.1:${APP_PORT}:3000|g" docker-compose.yml
   sed -i -E "s|127\.0\.0\.1:6767:5432|127.0.0.1:${DB_PORT}:5432|g" docker-compose.yml
-
-  grep -q "127.0.0.1:${APP_PORT}:3000" docker-compose.yml || warn "未检测到 3000 端口映射替换，可能官方 compose 已调整格式"
 }
 
 configure_env() {
@@ -223,7 +219,7 @@ configure_env() {
 
   set_env_kv .env JWT_AUTH_SECRET "$(openssl rand -hex 64)"
   set_env_kv .env JWT_API_TOKENS_SECRET "$(openssl rand -hex 64)"
-  set_env_kv .env METRICS_PASS "$(openssl rand -hex 64)"
+  set_env_kv .env METRICS_PASS "$(openssl rand -hex 32)"
   set_env_kv .env WEBHOOK_SECRET_HEADER "$(openssl rand -hex 64)"
 
   DB_PASS="$(openssl rand -hex 24)"
@@ -242,6 +238,38 @@ compose_down_safe() {
   docker rm -f remnawave remnawave-db remnawave-redis >/dev/null 2>&1 || true
 }
 
+wait_container_healthy() {
+  info "等待 Remnawave 容器健康..."
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
+
+  local ok=0
+  local i cid status
+
+  for i in $(seq 1 100); do
+    cid="$(docker compose ps -q remnawave 2>/dev/null || true)"
+    if [[ -n "$cid" ]]; then
+      status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
+      case "$status" in
+        healthy|running)
+          ok=1
+          break
+          ;;
+        exited|dead)
+          docker compose logs --tail=150 remnawave || true
+          die "remnawave 容器已退出"
+          ;;
+      esac
+    fi
+    sleep 3
+  done
+
+  [[ "$ok" -eq 1 ]] || {
+    docker compose ps || true
+    docker compose logs --tail=150 || true
+    die "Remnawave 容器未达到健康状态"
+  }
+}
+
 start_stack() {
   info "启动 Remnawave 容器..."
   cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
@@ -249,29 +277,13 @@ start_stack() {
   compose_down_safe
 
   docker compose up -d || {
-    warn "首次启动失败，尝试再次修复 Docker 网络后重启..."
+    warn "首次启动失败，尝试修复 Docker 网络后重试..."
     repair_docker_network
     compose_down_safe
     docker compose up -d || die "Remnawave 启动失败"
   }
 
-  info "等待 Remnawave 服务启动..."
-  local ok=0
-  local i
-  for i in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${APP_PORT}" >/dev/null 2>&1; then
-      ok=1
-      break
-    fi
-    sleep 3
-  done
-
-  if [[ "$ok" -ne 1 ]]; then
-    warn "服务仍未就绪，输出最近日志："
-    docker compose ps || true
-    docker compose logs --tail=150 || true
-    die "Remnawave 未能成功启动"
-  fi
+  wait_container_healthy
 }
 
 install_acme() {
@@ -299,6 +311,7 @@ issue_cert() {
   fi
 
   "$ACME_SH" --issue --standalone "${args[@]}" --keylength ec-256 --force || die "证书申请失败"
+
   "$ACME_SH" --install-cert -d "$MAIN_DOMAIN" --ecc \
     --fullchain-file "$CERT_DIR/fullchain.cer" \
     --key-file "$CERT_DIR/privkey.key" || die "证书安装失败"
@@ -342,9 +355,9 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port 443;
+        proxy_set_header X-Forwarded-Port \$server_port;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_read_timeout 300;
@@ -359,6 +372,26 @@ EOF
   nginx -t || die "Nginx 配置测试失败"
   systemctl enable nginx >/dev/null 2>&1 || true
   systemctl restart nginx || die "Nginx 启动失败"
+}
+
+verify_https() {
+  info "验证 HTTPS 反向代理..."
+  local ok=0
+  local i
+
+  for i in $(seq 1 40); do
+    if curl -kfsS --resolve "${MAIN_DOMAIN}:443:127.0.0.1" "https://${MAIN_DOMAIN}/" >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    sleep 3
+  done
+
+  [[ "$ok" -eq 1 ]] || {
+    systemctl status nginx --no-pager -l || true
+    docker compose -f "$INSTALL_DIR/docker-compose.yml" logs --tail=120 remnawave || true
+    die "HTTPS 反向代理验证失败"
+  }
 }
 
 open_firewall() {
@@ -378,13 +411,13 @@ main() {
   require_apt
 
   echo "=========================================="
-  echo " Remnawave 一键安装脚本（最终抗报错版）"
+  echo " Remnawave 一键安装脚本（最终可用版）"
   echo "=========================================="
-  echo "1. 使用官方 backend compose 与 .env"
-  echo "2. 下载失败自动重试 + git clone 兜底"
-  echo "3. 自动修复 Docker 网络链"
-  echo "4. 自动避让本地端口冲突"
-  echo "5. 自动配置 Nginx + Let's Encrypt"
+  echo "1. 使用官方 compose 与 .env.sample"
+  echo "2. 自动修复 Docker 网络链"
+  echo "3. 不再用 HTTP 直连后端测活"
+  echo "4. 先启动容器，再部署 HTTPS 反代"
+  echo "5. 最终通过 HTTPS 域名验证"
   echo "=========================================="
   echo
 
@@ -409,6 +442,7 @@ main() {
   install_acme
   issue_cert
   write_nginx
+  verify_https
   open_firewall
 
   echo
