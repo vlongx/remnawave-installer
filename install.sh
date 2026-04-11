@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
-# Remnawave 一键安装脚本（最终版）
-# 适用：Debian / Ubuntu
-# 特性：
-# - 使用官方 docker-compose-prod.yml 与 .env.sample
-# - 自动修复 Docker bridge / iptables 常见问题
-# - 自动避让本地端口冲突（3000/6767）
-# - 自动申请 Let's Encrypt 证书
-# - 自动配置 Nginx HTTPS 反向代理
+# Remnawave 一键安装脚本（最终抗报错版）
+# Debian / Ubuntu
 
-set -Eeuo pipefail
+set -u
 
 INSTALL_DIR="/opt/remnawave"
 NGINX_SITE="/etc/nginx/sites-available/remnawave.conf"
 NGINX_ENABLED="/etc/nginx/sites-enabled/remnawave.conf"
 CERT_DIR="/etc/nginx/ssl/remnawave"
 SYSCTL_FILE="/etc/sysctl.d/99-remnawave-docker.conf"
+TMP_DIR="/tmp/remnawave-installer.$$"
+
+APP_PORT=""
+DB_PORT=""
+ACME_SH=""
 
 info()  { echo -e "\033[1;32m[INFO]\033[0m $*"; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 error() { echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
-die()   { error "$*"; exit 1; }
+die()   { error "$*"; cleanup; exit 1; }
 
-trap 'error "脚本在第 $LINENO 行执行失败。"; exit 1' ERR
+cleanup() {
+  rm -rf "$TMP_DIR" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+
+run() {
+  "$@" || die "命令执行失败: $*"
+}
 
 require_root() {
-  [[ "$EUID" -eq 0 ]] || die "请使用 root 运行本脚本（例如：sudo bash install.sh）"
+  [[ "${EUID}" -eq 0 ]] || die "请使用 root 运行本脚本"
 }
 
 require_apt() {
@@ -38,7 +45,7 @@ backup_if_exists() {
 
 set_env_kv() {
   local file="$1" key="$2" value="$3"
-  if grep -qE "^${key}=" "$file"; then
+  if grep -qE "^${key}=" "$file" 2>/dev/null; then
     sed -i "s|^${key}=.*|${key}=${value}|" "$file"
   else
     echo "${key}=${value}" >> "$file"
@@ -47,48 +54,84 @@ set_env_kv() {
 
 port_in_use() {
   local port="$1"
-  ss -lnt "( sport = :$port )" 2>/dev/null | grep -q ":$port"
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
 }
 
 find_free_port() {
-  local start="$1"
-  local p="$start"
+  local p="$1"
   while port_in_use "$p"; do
     p=$((p + 1))
   done
   echo "$p"
 }
 
+retry_curl() {
+  local url="$1"
+  local dest="$2"
+  local i
+  for i in 1 2 3 4 5; do
+    if curl -fL --connect-timeout 15 --max-time 120 --retry 3 --retry-all-errors -o "$dest" "$url"; then
+      [[ -s "$dest" ]] && return 0
+    fi
+    warn "下载失败，第 ${i}/5 次重试: $url"
+    sleep 2
+  done
+  return 1
+}
+
+download_backend_file() {
+  local remote_file="$1"
+  local dest="$2"
+  local raw_url="https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/${remote_file}"
+
+  mkdir -p "$TMP_DIR"
+
+  if retry_curl "$raw_url" "$dest"; then
+    return 0
+  fi
+
+  warn "直接下载失败，切换到 git clone 兜底..."
+  rm -rf "$TMP_DIR/backend" >/dev/null 2>&1 || true
+
+  if git clone --depth 1 https://github.com/remnawave/backend.git "$TMP_DIR/backend" >/dev/null 2>&1; then
+    [[ -f "$TMP_DIR/backend/${remote_file}" ]] || die "官方仓库中未找到文件: ${remote_file}"
+    cp "$TMP_DIR/backend/${remote_file}" "$dest" || die "复制文件失败: ${remote_file}"
+    [[ -s "$dest" ]] || die "文件为空: $dest"
+    return 0
+  fi
+
+  die "下载官方文件失败: ${remote_file}"
+}
+
 install_base() {
   info "安装基础依赖..."
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  run apt-get update -y
+  DEBIAN_FRONTEND=noninteractive run apt-get install -y \
     curl socat cron openssl ca-certificates gnupg lsb-release \
-    nginx ufw iptables iproute2
+    nginx ufw iptables iproute2 git
 }
 
 install_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     info "未检测到 Docker，开始安装..."
-    curl -fsSL https://get.docker.com | sh
+    curl -fsSL https://get.docker.com | sh || die "Docker 安装失败"
   else
     info "Docker 已安装，跳过安装。"
   fi
 
   systemctl enable docker >/dev/null 2>&1 || true
-  systemctl restart docker || true
+  systemctl restart docker >/dev/null 2>&1 || true
 
   if ! docker compose version >/dev/null 2>&1; then
     info "安装 Docker Compose 插件..."
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin
+    run apt-get update -y
+    DEBIAN_FRONTEND=noninteractive run apt-get install -y docker-compose-plugin
   fi
 }
 
 fix_kernel_network() {
   info "修复内核转发与 bridge 网络参数..."
-
-  modprobe br_netfilter || true
+  modprobe br_netfilter >/dev/null 2>&1 || true
 
   cat > "$SYSCTL_FILE" <<'EOF'
 net.ipv4.ip_forward=1
@@ -97,37 +140,37 @@ net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 EOF
 
-  sysctl --system >/dev/null || true
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
-  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || true
-  sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null || true
-  sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null || true
+  sysctl --system >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+  sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1 || true
+  sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null 2>&1 || true
 
-  iptables -P FORWARD ACCEPT || true
-  ip6tables -P FORWARD ACCEPT || true
+  iptables -P FORWARD ACCEPT >/dev/null 2>&1 || true
+  ip6tables -P FORWARD ACCEPT >/dev/null 2>&1 || true
 }
 
 repair_docker_network() {
   info "检测并修复 Docker 网络链..."
 
-  systemctl stop docker.service >/dev/null 2>&1 || true
   systemctl stop docker.socket >/dev/null 2>&1 || true
+  systemctl stop docker.service >/dev/null 2>&1 || true
 
-  rm -f /var/lib/docker/network/files/local-kv.db || true
+  rm -f /var/lib/docker/network/files/local-kv.db >/dev/null 2>&1 || true
 
-  ip link show docker0 >/dev/null 2>&1 && ip link set docker0 down || true
+  ip link show docker0 >/dev/null 2>&1 && ip link set docker0 down >/dev/null 2>&1 || true
   ip link delete docker0 type bridge >/dev/null 2>&1 || true
 
   iptables -t nat -N DOCKER >/dev/null 2>&1 || true
   iptables -t filter -N DOCKER-USER >/dev/null 2>&1 || true
   iptables -t filter -N DOCKER-FORWARD >/dev/null 2>&1 || true
 
-  iptables -t filter -C FORWARD -j DOCKER-USER >/dev/null 2>&1 || iptables -t filter -I FORWARD 1 -j DOCKER-USER || true
-  iptables -t filter -C FORWARD -j DOCKER-FORWARD >/dev/null 2>&1 || iptables -t filter -A FORWARD -j DOCKER-FORWARD || true
-  iptables -t filter -C DOCKER-USER -j RETURN >/dev/null 2>&1 || iptables -t filter -A DOCKER-USER -j RETURN || true
+  iptables -t filter -C FORWARD -j DOCKER-USER >/dev/null 2>&1 || iptables -t filter -I FORWARD 1 -j DOCKER-USER >/dev/null 2>&1 || true
+  iptables -t filter -C FORWARD -j DOCKER-FORWARD >/dev/null 2>&1 || iptables -t filter -A FORWARD -j DOCKER-FORWARD >/dev/null 2>&1 || true
+  iptables -t filter -C DOCKER-USER -j RETURN >/dev/null 2>&1 || iptables -t filter -A DOCKER-USER -j RETURN >/dev/null 2>&1 || true
 
   systemctl start docker.socket >/dev/null 2>&1 || true
-  systemctl start docker.service
+  systemctl start docker.service >/dev/null 2>&1 || die "Docker 启动失败"
   sleep 5
 
   docker network inspect bridge >/dev/null 2>&1 || true
@@ -135,42 +178,44 @@ repair_docker_network() {
 
 prepare_project() {
   info "准备 Remnawave 目录与配置..."
-  mkdir -p "$INSTALL_DIR"
-  cd "$INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR" || die "无法创建目录: $INSTALL_DIR"
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
   backup_if_exists "$INSTALL_DIR/docker-compose.yml"
   backup_if_exists "$INSTALL_DIR/.env"
 
   info "下载官方 docker-compose 与 .env.sample..."
-  curl -fsSL https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/docker-compose-prod.yml -o docker-compose.yml
+  download_backend_file "docker-compose-prod.yml" "$INSTALL_DIR/docker-compose.yml"
 
-  if [[ ! -f .env ]]; then
-    curl -fsSL https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/.env.sample -o .env
+  if [[ ! -f "$INSTALL_DIR/.env" ]]; then
+    download_backend_file ".env.sample" "$INSTALL_DIR/.env"
   fi
+
+  [[ -s "$INSTALL_DIR/docker-compose.yml" ]] || die "docker-compose.yml 下载后为空"
+  [[ -s "$INSTALL_DIR/.env" ]] || die ".env 下载后为空"
 }
 
 select_ports() {
   APP_PORT="$(find_free_port 3000)"
   DB_PORT="$(find_free_port 6767)"
 
-  if [[ "$APP_PORT" != "3000" ]]; then
-    warn "127.0.0.1:3000 已被占用，自动改用 127.0.0.1:${APP_PORT}"
-  fi
-
-  if [[ "$DB_PORT" != "6767" ]]; then
-    warn "127.0.0.1:6767 已被占用，自动改用 127.0.0.1:${DB_PORT}"
-  fi
+  [[ "$APP_PORT" != "3000" ]] && warn "127.0.0.1:3000 已占用，改用 127.0.0.1:${APP_PORT}"
+  [[ "$DB_PORT" != "6767" ]] && warn "127.0.0.1:6767 已占用，改用 127.0.0.1:${DB_PORT}"
 }
 
 patch_compose_ports() {
   info "调整 docker-compose 端口绑定..."
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
   sed -i -E "s|127\.0\.0\.1:3000:3000|127.0.0.1:${APP_PORT}:3000|g" docker-compose.yml
   sed -i -E "s|127\.0\.0\.1:6767:5432|127.0.0.1:${DB_PORT}:5432|g" docker-compose.yml
+
+  grep -q "127.0.0.1:${APP_PORT}:3000" docker-compose.yml || warn "未检测到 3000 端口映射替换，可能官方 compose 已调整格式"
 }
 
 configure_env() {
   info "写入 Remnawave 环境变量..."
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
 
   set_env_kv .env FRONT_END_DOMAIN "$MAIN_DOMAIN"
   set_env_kv .env PANEL_DOMAIN "$MAIN_DOMAIN"
@@ -191,18 +236,29 @@ configure_env() {
   fi
 }
 
-start_stack() {
-  info "启动 Remnawave 容器..."
-  cd "$INSTALL_DIR"
-
+compose_down_safe() {
+  cd "$INSTALL_DIR" || return 0
   docker compose down --remove-orphans >/dev/null 2>&1 || true
   docker rm -f remnawave remnawave-db remnawave-redis >/dev/null 2>&1 || true
+}
 
-  docker compose up -d
+start_stack() {
+  info "启动 Remnawave 容器..."
+  cd "$INSTALL_DIR" || die "无法进入目录: $INSTALL_DIR"
+
+  compose_down_safe
+
+  docker compose up -d || {
+    warn "首次启动失败，尝试再次修复 Docker 网络后重启..."
+    repair_docker_network
+    compose_down_safe
+    docker compose up -d || die "Remnawave 启动失败"
+  }
 
   info "等待 Remnawave 服务启动..."
   local ok=0
-  for _ in $(seq 1 60); do
+  local i
+  for i in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:${APP_PORT}" >/dev/null 2>&1; then
       ok=1
       break
@@ -214,26 +270,27 @@ start_stack() {
     warn "服务仍未就绪，输出最近日志："
     docker compose ps || true
     docker compose logs --tail=150 || true
-    die "Remnawave 未能成功启动。"
+    die "Remnawave 未能成功启动"
   fi
 }
 
 install_acme() {
   info "安装 acme.sh..."
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-    curl https://get.acme.sh | sh -s email="$EMAIL"
+    curl https://get.acme.sh | sh -s email="$EMAIL" || die "acme.sh 安装失败"
   fi
   ACME_SH="/root/.acme.sh/acme.sh"
+  [[ -x "$ACME_SH" ]] || die "acme.sh 不存在"
 }
 
 issue_cert() {
   info "申请 SSL 证书..."
-  mkdir -p "$CERT_DIR"
+  mkdir -p "$CERT_DIR" || die "无法创建证书目录"
 
   systemctl stop nginx >/dev/null 2>&1 || true
 
-  "$ACME_SH" --set-default-ca --server letsencrypt
-  "$ACME_SH" --register-account -m "$EMAIL" || true
+  "$ACME_SH" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+  "$ACME_SH" --register-account -m "$EMAIL" >/dev/null 2>&1 || true
 
   local args=()
   args+=(-d "$MAIN_DOMAIN")
@@ -241,13 +298,13 @@ issue_cert() {
     args+=(-d "$SUB_DOMAIN")
   fi
 
-  "$ACME_SH" --issue --standalone "${args[@]}" --keylength ec-256 --force
+  "$ACME_SH" --issue --standalone "${args[@]}" --keylength ec-256 --force || die "证书申请失败"
   "$ACME_SH" --install-cert -d "$MAIN_DOMAIN" --ecc \
     --fullchain-file "$CERT_DIR/fullchain.cer" \
-    --key-file "$CERT_DIR/privkey.key"
+    --key-file "$CERT_DIR/privkey.key" || die "证书安装失败"
 
-  [[ -f "$CERT_DIR/fullchain.cer" ]] || die "证书安装失败：缺少 fullchain.cer"
-  [[ -f "$CERT_DIR/privkey.key" ]] || die "证书安装失败：缺少 privkey.key"
+  [[ -f "$CERT_DIR/fullchain.cer" ]] || die "缺少 fullchain.cer"
+  [[ -f "$CERT_DIR/privkey.key" ]] || die "缺少 privkey.key"
 }
 
 write_nginx() {
@@ -299,9 +356,9 @@ EOF
   rm -f /etc/nginx/sites-enabled/default
   ln -sf "$NGINX_SITE" "$NGINX_ENABLED"
 
-  nginx -t
+  nginx -t || die "Nginx 配置测试失败"
   systemctl enable nginx >/dev/null 2>&1 || true
-  systemctl restart nginx
+  systemctl restart nginx || die "Nginx 启动失败"
 }
 
 open_firewall() {
@@ -311,7 +368,7 @@ open_firewall() {
       ufw allow 80/tcp >/dev/null 2>&1 || true
       ufw allow 443/tcp >/dev/null 2>&1 || true
     else
-      warn "UFW 未启用，跳过 UFW 规则调整。"
+      warn "UFW 未启用，跳过防火墙调整。"
     fi
   fi
 }
@@ -321,31 +378,24 @@ main() {
   require_apt
 
   echo "=========================================="
-  echo " Remnawave 一键安装脚本（最终版）"
+  echo " Remnawave 一键安装脚本（最终抗报错版）"
   echo "=========================================="
-  echo "说明："
-  echo "1. 使用官方 docker-compose-prod.yml"
-  echo "2. 自动修复 Docker 网络链常见故障"
-  echo "3. 自动避让 3000 / 6767 端口冲突"
-  echo "4. 自动配置 Nginx + Let's Encrypt"
-  echo "5. 不清空整机 iptables 规则"
+  echo "1. 使用官方 backend compose 与 .env"
+  echo "2. 下载失败自动重试 + git clone 兜底"
+  echo "3. 自动修复 Docker 网络链"
+  echo "4. 自动避让本地端口冲突"
+  echo "5. 自动配置 Nginx + Let's Encrypt"
   echo "=========================================="
   echo
 
   read -rp "请输入【面板访问域名】（例如 panel.example.com）: " MAIN_DOMAIN
-  [[ -n "$MAIN_DOMAIN" ]] || die "面板域名不能为空"
+  [[ -n "${MAIN_DOMAIN}" ]] || die "面板域名不能为空"
 
   read -rp "请输入【订阅域名】（留空则与面板域名相同）: " SUB_DOMAIN
   SUB_DOMAIN="${SUB_DOMAIN:-$MAIN_DOMAIN}"
 
   read -rp "请输入【证书邮箱】（例如 admin@example.com）: " EMAIL
-  [[ -n "$EMAIL" ]] || die "证书邮箱不能为空"
-
-  echo
-  echo "面板域名: $MAIN_DOMAIN"
-  echo "订阅域名: $SUB_DOMAIN"
-  echo "证书邮箱: $EMAIL"
-  echo
+  [[ -n "${EMAIL}" ]] || die "证书邮箱不能为空"
 
   install_base
   install_docker
